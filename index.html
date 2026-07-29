@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Comic Chat</title>
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path d="M4 4 Q2 4 2 7 L2 17 Q2 20 5 20 L8 20 L6 27 L14 20 L27 20 Q30 20 30 17 L30 7 Q30 4 27 4 Z" fill="white" stroke="black" stroke-width="2.2"/><text x="16" y="16" text-anchor="middle" font-family="Comic Sans MS,cursive" font-size="11" font-weight="bold" fill="black">CC</text></svg>'>
+<style>
+  :root{ --face:#c0c0c0; --lt:#ffffff; --dk:#808080; }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; margin:0; }
+  body{ font-family:"Comic Sans MS","Comic Sans",cursive; background:#008080; display:flex; flex-direction:column; }
+  .win{ margin:8px; flex:1; display:flex; flex-direction:column; min-height:0; background:var(--face);
+        border:2px solid; border-color:var(--lt) var(--dk) var(--dk) var(--lt); box-shadow:2px 2px 6px rgba(0,0,0,.4); }
+  .titlebar{ background:linear-gradient(90deg,#000080,#1084d0); color:#fff; padding:4px 8px; font-weight:bold; font-size:14px; }
+  .titlebar .sub{ font-weight:normal; font-size:11px; opacity:.85; }
+  .toolbar{ display:flex; align-items:center; gap:6px; padding:5px 8px; flex-wrap:wrap; border-bottom:2px solid var(--dk); }
+  button, select{ font-family:inherit; font-size:12px; padding:3px 9px; cursor:pointer; background:var(--face);
+        border:2px solid; border-color:var(--lt) var(--dk) var(--dk) var(--lt); }
+  button:active{ border-color:var(--dk) var(--lt) var(--lt) var(--dk); }
+  button.tog.on{ border-color:var(--dk) var(--lt) var(--lt) var(--dk); background:#e6e6e6; }
+  label{ font-size:12px; }
+  #page{ flex:1; overflow-y:auto; background:#7a7a7a; padding:14px; }
+  #strip{ background:#fff; margin:0 auto; display:flex; flex-wrap:wrap; gap:6px; align-content:flex-start;
+          padding:10px; box-shadow:0 2px 8px rgba(0,0,0,.5); }
+  #strip .hint{ color:#777; font-size:13px; padding:20px; }
+  svg.panel{ display:block; }
+  .composer{ display:flex; gap:10px; padding:8px; align-items:stretch; flex-wrap:wrap; border-top:2px solid var(--lt); }
+  .rosterbox{ display:flex; flex-direction:column; gap:2px; }
+  #roster{ display:flex; gap:4px; flex-wrap:wrap; max-width:390px; }
+  #roster.collapsed{ max-height:132px; overflow:hidden; }
+  #rostermore{ font-size:10px; padding:1px 6px; align-self:flex-start; }
+  .porta{ width:54px; padding:2px; text-align:center; font-size:10px; line-height:1.1; background:var(--face); cursor:pointer;
+          border:2px solid; border-color:var(--lt) var(--dk) var(--dk) var(--lt); }
+  .porta.sel{ background:#cfe3ff; border-color:#000080; }
+  .porta svg,.porta img{ display:block; width:100%; height:42px; background:#fff; border:1px solid #999; object-fit:contain; }
+  .wheelbox{ text-align:center; font-size:11px; }
+  #wheel{ cursor:crosshair; touch-action:none; }
+  .inputcol{ flex:1; display:flex; flex-direction:column; gap:5px; min-width:250px; }
+  .typerow{ display:flex; gap:4px; flex-wrap:wrap; align-items:center; }
+  .sendrow{ display:flex; gap:6px; }
+  #msg{ flex:1; font-family:inherit; font-size:14px; padding:6px 8px; background:#fff;
+        border:2px solid; border-color:var(--dk) var(--lt) var(--lt) var(--dk); }
+  .help{ font-size:10px; color:#444; }
+  .note{ font-size:10px; color:#7a0000; }
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="titlebar">💬 Web Comic Chat <span class="sub">— a faithful web port of Microsoft Comic Chat (1996)</span></div>
+  <div class="toolbar">
+    <label>Artwork:
+      <select id="artsel">
+        <option value="original">Original (Microsoft)</option>
+        <option value="modern">Modern (drawn)</option>
+      </select>
+    </label>
+    <label>Scene: <select id="bgsel"></select></label>
+    <label>Panels wide: <select id="wide"><option>1</option><option>2</option><option selected>3</option><option>4</option></select></label>
+    <label><input type="checkbox" id="titlepanel" checked> Title panel</label>
+    <button id="demo">▶ Play demo</button>
+    <button id="save">💾 Save PNG</button>
+    <button id="clear">🗑 Clear</button>
+    <span id="dropzone"><button onclick="document.getElementById('artfile').click()">🎨 Load original artwork…</button><input type="file" id="artfile" accept=".json,application/json" hidden></span>
+    <span class="help" id="statusnote" style="margin-left:auto"></span>
+  </div>
+  <div id="page"><div id="strip"><div class="hint">Pick a character, set an emotion on the wheel, and say something…</div></div></div>
+  <div class="composer">
+    <div class="rosterbox">
+      <div id="roster" class="collapsed"></div>
+      <button id="rostermore" hidden></button>
+    </div>
+    <div class="wheelbox">
+      <svg id="wheel" width="132" height="132"></svg>
+      <div id="wheellabel">neutral</div>
+    </div>
+    <div class="inputcol">
+      <div class="typerow">
+        <button class="tog on" data-mode="say">💬 Say</button>
+        <button class="tog" data-mode="think">💭 Think</button>
+        <button class="tog" data-mode="whisper">🤫 Whisper</button>
+        <button class="tog" data-mode="action">🎬 Action</button>
+        <label id="aibox" hidden><input type="checkbox" id="aitoggle" checked> 🤖 Cast replies</label>
+        <span class="help">Shouting isn't a balloon — type in CAPS or pick Shout on the wheel.</span>
+      </div>
+      <div class="sendrow">
+        <input id="msg" maxlength="200" placeholder="Type a message…">
+        <button id="send" style="font-weight:bold">Send</button>
+      </div>
+      <div class="help" id="rulehint">&nbsp;</div>
+    </div>
+  </div>
+</div>
+
+<script src="art-assets.js?v=2"></script>
+<script src="engine.js"></script>
+<script src="art-modern.js"></script>
+<script src="art-builder.js"></script>
+<script src="art-original.js?v=7" onerror="window.__noOriginal=1"></script>
+<script src="app.js"></script>
+
+</body>
+</html>
