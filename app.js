@@ -678,9 +678,13 @@ ${cast}
 Write ${art.name}'s next line. Playful and funny, 1-2 short sentences, stay in character, react to what was just said.
 Plain text only — no markdown, no asterisks or other emphasis marks (the comic lettering has no bold or italics).
 
-Reply with ONLY this JSON, nothing else:
-{"text":"...","emotion":"neutral|happy|coy|bored|scared|sad|angry|shout|laugh","intensity":0.7,"mode":"say|think|whisper|action"}
-For mode "action", "text" is a third-person action phrase WITHOUT the name (e.g. "hands Anna a coffee").`;
+Reply with ONLY a JSON object, nothing else. Its fields:
+"text" — the actual line of dialogue you wrote (a real sentence, never a placeholder)
+"emotion" — exactly one word from: neutral, happy, coy, bored, scared, sad, angry, shout, laugh
+"intensity" — a number between 0 and 1
+"mode" — exactly one word from: say, think, whisper, action
+For mode "action", "text" is a third-person action phrase WITHOUT the name (e.g. "hands Anna a coffee").
+Example of the format (do NOT copy its words): {"text":"${AI_EXAMPLE}","emotion":"coy","intensity":0.6,"mode":"say"}`;
 }
 /* An AI participant decides for ITSELF whether to answer a message:
    always when addressed by name, or (if marked chatty) when the message
@@ -711,6 +715,9 @@ function aiObserve(msg){
   }
 }
 
+/* the format example shown to the model; any echo of it is rejected */
+const AI_EXAMPLE = "Ha! I knew you would say that.";
+
 /* AI replies must land as plain comic-balloon text, not markdown */
 function stripMarkdown(s){
   return s
@@ -723,21 +730,40 @@ function stripMarkdown(s){
     .replace(/^#+\s*/gm, "")
     .replace(/\s+/g, " ").trim();
 }
+/* one generation attempt; returns null if the model parroted the format
+   template ("...", the example sentence, or nothing) instead of writing a line */
+async function aiAttempt(p, extra){
+  const raw = await fetchAI(aiPrompt(p.charId) + (extra || ""));
+  const m = raw.match(/\{[\s\S]*\}/);
+  const r = JSON.parse(m ? m[0] : raw);
+  const text = stripMarkdown(String(r.text||"")).trim();
+  const parroted = !text ||
+    /^[.…\s]+$/.test(text) ||                                   // "...", "…"
+    text.toLowerCase().replace(/[^a-z ]/g,"") ===
+      AI_EXAMPLE.toLowerCase().replace(/[^a-z ]/g,"");
+  return parroted ? null : {r, text};
+}
 async function aiReplyAs(p){
   p.busy = true;
   const hint = document.getElementById("rulehint");
   hint.textContent = `💭 ${getArt(p.charId).name} is thinking…`;
   try{
-    const raw = await fetchAI(aiPrompt(p.charId));
-    const m = raw.match(/\{[\s\S]*\}/);
-    const r = JSON.parse(m ? m[0] : raw);
+    let got = await aiAttempt(p);
+    if(!got) got = await aiAttempt(p,
+      `\n\nIMPORTANT: your previous reply used a placeholder instead of dialogue. ` +
+      `The "text" field must be a real line ${getArt(p.charId).name} would actually say in this scene.`);
+    if(!got){
+      hint.textContent = "🤖 " + getArt(p.charId).name + " had nothing to say (the model returned a placeholder twice).";
+      return;
+    }
+    const r = got.r;
     const emoKey = String(r.emotion||"neutral").toLowerCase();
     const wheelEntry = WHEEL.find(w=>w.key===emoKey || (emoKey==="laughing" && w.key==="laugh"));
     wheelState[p.charId] = wheelEntry
       ? {emotion: wheelEntry.em, intensity: Math.max(0.25, Math.min(1, +r.intensity || 0.7)), touched:true}
       : {emotion: EM.HAPPY, intensity: 0, touched:true};
     const mode = ["say","think","whisper","action"].includes(r.mode) ? r.mode : "say";
-    send(stripMarkdown(String(r.text||"")).slice(0,200), p.charId, mode, {ai:true});
+    send(got.text.slice(0,200), p.charId, mode, {ai:true});
   }catch(e){
     hint.textContent = "🤖 " + getArt(p.charId).name + " lost their train of thought (" +
                        String(e.message||e).slice(0,80) + ")";
