@@ -58,51 +58,67 @@ function edgePoints(x0,y0,x1,y1,nx,ny,phase){
   }
   return pts;
 }
-function smoothClosed(pts){
+/* Closed uniform cubic B-spline through the wavy control points — the
+   original's CBeta spline (balloon.cpp CreateBalloonSpline). An approximating
+   spline rounds the bumps into Woodring's soft cloud lobes; the interpolating
+   scallops used before read sharp and angular. */
+function bsplineClosed(pts){
   const n = pts.length;
-  if(!n) return "";
-  const mid = (a,b)=>({x:(a.x+b.x)/2, y:(a.y+b.y)/2});
+  if(n < 3) return "";
   const f = v=>v.toFixed(1);
-  let m0 = mid(pts[n-1], pts[0]);
-  let d = `M ${f(m0.x)} ${f(m0.y)}`;
+  const P = i=>pts[(i+n)%n];
+  let d = "";
   for(let i=0;i<n;i++){
-    const cur = pts[i], next = pts[(i+1)%n], m = mid(cur,next);
-    if(cur.sharp || next.sharp) d += ` L ${f(cur.x)} ${f(cur.y)} L ${f(m.x)} ${f(m.y)}`;
-    else d += ` Q ${f(cur.x)} ${f(cur.y)} ${f(m.x)} ${f(m.y)}`;
+    const p0=P(i-1), p1=P(i), p2=P(i+1), p3=P(i+2);
+    const b0={x:(p0.x+4*p1.x+p2.x)/6, y:(p0.y+4*p1.y+p2.y)/6};
+    const b1={x:(2*p1.x+p2.x)/3,      y:(2*p1.y+p2.y)/3};
+    const b2={x:(p1.x+2*p2.x)/3,      y:(p1.y+2*p2.y)/3};
+    const b3={x:(p1.x+4*p2.x+p3.x)/6, y:(p1.y+4*p2.y+p3.y)/6};
+    d += (i ? "" : `M ${f(b0.x)} ${f(b0.y)}`) +
+         ` C ${f(b1.x)} ${f(b1.y)} ${f(b2.x)} ${f(b2.y)} ${f(b3.x)} ${f(b3.y)}`;
   }
   return d + " Z";
 }
-function tailFor(b, body){
-  if(!body) return null;
-  const c = b.cloud;
-  let ay = body.top - 200;                                  // tip sits just above the head
-  if(ay - c.bottom < MIN_TAIL_H) ay = c.bottom + MIN_TAIL_H;
-  let xbreak = (b.routeRgn.left + b.routeRgn.right)/2;
-  xbreak = Math.max(c.left + TAIL_MOUTH + 60, Math.min(c.right - TAIL_MOUTH - 60, xbreak));
-  let ax = body.arrowX;
-  const maxdx = ay - c.bottom;                              // clamp to 45 deg from vertical
-  if(Math.abs(ax - xbreak) > maxdx) ax = xbreak + Math.sign(ax - xbreak) * maxdx;
-  return {x:xbreak, ax, ay};
-}
-function cloudPath(r, tail){
+function cloudPath(r){
   const top    = edgePoints(r.left, r.top, r.right, r.top, 0, -1, 0);
   const right  = edgePoints(r.right, r.top, r.right, r.bottom, 1, 0, 1);
-  const bottomRaw = edgePoints(r.right, r.bottom, r.left, r.bottom, 0, 1, 0);
+  const bottom = edgePoints(r.right, r.bottom, r.left, r.bottom, 0, 1, 0);
   const left   = edgePoints(r.left, r.bottom, r.left, r.top, -1, 0, 1);
-  let bottom = bottomRaw;
-  if(tail){
-    const hi = tail.x + TAIL_MOUTH, lo = tail.x - TAIL_MOUTH;
-    const ins = [{x:hi, y:r.bottom, sharp:true}, {x:tail.ax, y:tail.ay, sharp:true}, {x:lo, y:r.bottom, sharp:true}];
-    const out = []; let placed = false;
-    for(const p of bottomRaw){                              // bottom runs right -> left
-      if(!placed && p.x < hi){ out.push(...ins); placed = true; }
-      if(p.x <= hi && p.x >= lo) continue;
-      out.push(p);
-    }
-    if(!placed) out.push(...ins);
-    bottom = out;
-  }
-  return smoothClosed(top.concat(right, bottom, left));
+  return bsplineClosed(top.concat(right, bottom, left));
+}
+/* The tail: two opposing arcs (CArc bulge = 5% of tail length), drawn OVER the
+   cloud so its white fill opens the balloon border at the mouth. The apex
+   stays AT the speaker — the 45-degree clamp moves the MOUTH along the
+   balloon's bottom edge (balloon.cpp:1466), never the apex; swinging the apex
+   sideways is what made tails wander across neighboring balloons. */
+function tailPath(b, body, dashed){
+  if(!body) return "";
+  const c = b.cloud;
+  const ax = body.arrowX;
+  let ay = body.top - 200;
+  if(ay - c.bottom < MIN_TAIL_H) ay = c.bottom + MIN_TAIL_H;
+  const heightDelta = ay - c.bottom;
+  let xbreak = (b.routeRgn.left + b.routeRgn.right)/2;
+  if(Math.abs(ax - xbreak) > heightDelta)                    // 45° from vertical
+    xbreak = ax - Math.sign(ax - xbreak) * heightDelta;
+  xbreak = Math.max(c.left + TAIL_MOUTH + 40, Math.min(c.right - TAIL_MOUTH - 40, xbreak));
+  const mouthY = c.bottom - 40;                              // tucked inside the border
+  const L = {x: xbreak - TAIL_MOUTH, y: mouthY};
+  const R = {x: xbreak + TAIL_MOUTH, y: mouthY};
+  const A = {x: ax, y: ay};
+  const alt = 0.05 * Math.hypot(ax - xbreak, ay - mouthY);
+  const sign = ax > xbreak ? 1 : -1;
+  const q = (P, Q, bulge)=>{
+    const mx=(P.x+Q.x)/2, my=(P.y+Q.y)/2;
+    const dx=Q.x-P.x, dy=Q.y-P.y, len=Math.hypot(dx,dy)||1;
+    return {x: mx - dy/len*2*bulge, y: my + dx/len*2*bulge};
+  };
+  const c1 = q(L, A,  sign*alt), c2 = q(A, R, -sign*alt);
+  const f = v=>v.toFixed(1);
+  const d = `M ${f(L.x)} ${f(L.y)} Q ${f(c1.x)} ${f(c1.y)} ${f(A.x)} ${f(A.y)}`+
+            ` Q ${f(c2.x)} ${f(c2.y)} ${f(R.x)} ${f(R.y)}`;
+  const stroke = dashed ? ` stroke-dasharray="150 90" stroke="#777"` : ` stroke="#000"`;
+  return `<path d="${d}" fill="#fff"${stroke} stroke-width="28" stroke-linejoin="round"/>`;
 }
 function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
@@ -115,10 +131,11 @@ function balloonSvg(b, body){
   if(m.mode === "action"){
     parts.push(`<rect x="${c.left}" y="${c.top}" width="${c.right-c.left}" height="${c.bottom-c.top}" fill="#fff" stroke="#000" stroke-width="28"/>`);
   } else {
-    const tail = m.mode === "think" ? null : tailFor(b, body);
     const dash = italic ? ` stroke-dasharray="150 90"` : "";
-    if(italic) parts.push(`<path d="${cloudPath(c, tail)}" fill="#fff" stroke="#fff" stroke-width="100"/>`);
-    parts.push(`<path d="${cloudPath(c, tail)}" fill="#fff" stroke="#000" stroke-width="28"${dash}/>`);
+    const stroke = italic ? "#777" : "#000";
+    if(italic) parts.push(`<path d="${cloudPath(c)}" fill="#fff" stroke="#fff" stroke-width="100"/>`);
+    parts.push(`<path d="${cloudPath(c)}" fill="#fff" stroke="${stroke}" stroke-width="28"${dash}/>`);
+    if(m.mode !== "think") parts.push(tailPath(b, body, italic));
     if(m.mode === "think" && body){
       // chain of ellipses growing toward the balloon (balloon.cpp:1826)
       const ex = (b.routeRgn.left + b.routeRgn.right)/2, ey = c.bottom;
