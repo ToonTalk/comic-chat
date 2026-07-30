@@ -260,7 +260,7 @@ function detectTalkTos(text, fromId){
   }
   return out;
 }
-function send(raw, charId, modeOverride){
+function send(raw, charId, modeOverride, flags){
   let text = (raw||"").trim();
   if(!text) return;
   let mode = modeOverride || curMode;
@@ -278,12 +278,22 @@ function send(raw, charId, modeOverride){
     display: (mode === "action" ? getArt(id).name + " " + text : text).toUpperCase(),
     mode,
     talkTos: detectTalkTos(text, id),
-    wheel: (w && w.touched) ? {emotion:w.emotion, intensity:w.intensity} : null
+    wheel: (w && w.touched) ? {emotion:w.emotion, intensity:w.intensity} : null,
+    ai: !!(flags && flags.ai)
   };
-  state.msgs.push(msg);
   if(w){ w.touched = false; w.emotion = EM.HAPPY; w.intensity = 0; }   // ResetAvatar
+  // In a room the HOST owns message order, so everyone's strip lays out
+  // identically; a guest's own line comes back via the host's broadcast.
+  if(typeof netDispatch === "function" && netActive() && netDispatch(msg)) return;
+  applyNetMsg(msg);
+}
+
+/* every message — local or from the network — lands here */
+function applyNetMsg(msg){
+  state.msgs.push(msg);
   persist();
   renderAll(); renderRoster(); renderWheel();
+  if(typeof aiObserve === "function") aiObserve(msg);
 }
 
 /* ================================== UI =================================== */
@@ -398,12 +408,9 @@ document.querySelectorAll(".tog").forEach(b=> b.onclick = ()=>{
 });
 document.getElementById("send").onclick = ()=>{
   const inp = document.getElementById("msg");
-  const text = inp.value.trim(), speaker = curChar;
   send(inp.value); inp.value = "";
   document.querySelectorAll(".tog").forEach(x=>x.classList.toggle("on", x.dataset.mode === "say"));
   curMode = "say"; updatePlaceholder(); updateRuleHint(); inp.focus();
-  const tog = document.getElementById("aitoggle");
-  if(text && tog && tog.checked && typeof aiReply === "function") aiReply(text, speaker);
 };
 document.getElementById("msg").addEventListener("keydown", e=>{
   if(e.key === "Enter" || e.keyCode === 13) document.getElementById("send").click();
@@ -522,16 +529,50 @@ const AI_BIOS = {
   jordan:   "cool and mysterious; says little, means much",
   connor:   "an odd knight-ish figure; formal, chivalrous, slightly out of era"
 };
-function aiAvailable(){ return !!(window.claude && typeof window.claude.complete === "function"); }
-let aiBusy = false;
+/* ---- Claude API with a user-supplied key (static-page deployment) ---- */
+const AI_MODELS = ["claude-sonnet-5", "claude-haiku-4-5-20251001"];
+function aiKey(){ try{ return localStorage.getItem("comicchat-apikey") || ""; }catch(e){ return ""; } }
+function aiSetKey(k){ try{ if(k) localStorage.setItem("comicchat-apikey", k); else localStorage.removeItem("comicchat-apikey"); }catch(e){} }
+function aiAvailable(){ return !!aiKey(); }
 
-function pickResponder(userText, userChar){
-  const low = userText.toLowerCase();
-  const ids = castIds().filter(id=>id !== userChar);
-  for(const id of ids) if(checkWord(low, getArt(id).name.toLowerCase())) return id;
-  for(let i = state.msgs.length-2; i >= 0; i--)
-    if(state.msgs[i].charId !== userChar) return state.msgs[i].charId;
-  return ids[Math.floor(Math.random()*Math.min(8, ids.length))];
+async function fetchClaude(prompt){
+  let lastErr = null;
+  for(const model of AI_MODELS){
+    try{
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": aiKey(),
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify({model, max_tokens: 300,
+          messages: [{role:"user", content: prompt}]})
+      });
+      if(!res.ok){
+        const body = await res.text();
+        // an unknown-model error should fall through to the next model id;
+        // anything else (bad key, quota) is fatal for both
+        if(res.status === 404 || /model/i.test(body)) { lastErr = new Error(body.slice(0,200)); continue; }
+        throw new Error("API " + res.status + ": " + body.slice(0,200));
+      }
+      const data = await res.json();
+      return (data.content && data.content[0] && data.content[0].text) || "";
+    }catch(e){ lastErr = e; if(!/model/i.test(String(e))) break; }
+  }
+  throw lastErr || new Error("no model worked");
+}
+
+/* ---- AI participants: characters played by Claude with YOUR key ---- */
+window.AI_PLAYERS = [];   // [{name, charId, chatty, busy}]
+try{
+  const saved = JSON.parse(localStorage.getItem("comicchat-aiplayers"));
+  if(Array.isArray(saved)) window.AI_PLAYERS = saved.map(p=>({name:p.name, charId:p.charId, chatty:!!p.chatty, busy:false}));
+}catch(e){}
+function aiPersistPlayers(){
+  try{ localStorage.setItem("comicchat-aiplayers",
+    JSON.stringify(window.AI_PLAYERS.map(p=>({name:p.name, charId:p.charId, chatty:p.chatty})))); }catch(e){}
 }
 function aiPrompt(responder){
   const art = getArt(responder);
@@ -551,34 +592,41 @@ Reply with ONLY this JSON, nothing else:
 {"text":"...","emotion":"neutral|happy|coy|bored|scared|sad|angry|shout|laugh","intensity":0.7,"mode":"say|think|whisper|action"}
 For mode "action", "text" is a third-person action phrase WITHOUT the name (e.g. "hands Anna a coffee").`;
 }
-async function aiReply(userText, userChar){
-  if(aiBusy || !aiAvailable()) return;
-  const responder = pickResponder(userText, userChar);
-  if(!responder) return;
-  aiBusy = true;
+/* An AI participant decides for ITSELF whether to answer a message:
+   always when addressed by name, or (if marked chatty) when the message
+   addressed nobody in particular. AI players never answer other AIs, so two
+   of them can't chain-react forever. */
+function aiObserve(msg){
+  if(msg.ai || !aiAvailable()) return;
+  for(const p of window.AI_PLAYERS){
+    if(p.busy || p.charId === msg.charId) continue;
+    const addressed = (msg.talkTos||[]).includes(p.charId) ||
+                      checkWord(msg.text.toLowerCase(), getArt(p.charId).name.toLowerCase());
+    if(addressed || (p.chatty && !(msg.talkTos||[]).length)) aiReplyAs(p);
+  }
+}
+async function aiReplyAs(p){
+  p.busy = true;
   const hint = document.getElementById("rulehint");
-  hint.textContent = `💭 ${getArt(responder).name} is thinking…`;
+  hint.textContent = `💭 ${getArt(p.charId).name} is thinking…`;
   try{
-    const raw = await window.claude.complete(aiPrompt(responder));
+    const raw = await fetchClaude(aiPrompt(p.charId));
     const m = raw.match(/\{[\s\S]*\}/);
     const r = JSON.parse(m ? m[0] : raw);
     const emoKey = String(r.emotion||"neutral").toLowerCase();
     const wheelEntry = WHEEL.find(w=>w.key===emoKey || (emoKey==="laughing" && w.key==="laugh"));
-    wheelState[responder] = wheelEntry
+    wheelState[p.charId] = wheelEntry
       ? {emotion: wheelEntry.em, intensity: Math.max(0.25, Math.min(1, +r.intensity || 0.7)), touched:true}
       : {emotion: EM.HAPPY, intensity: 0, touched:true};
     const mode = ["say","think","whisper","action"].includes(r.mode) ? r.mode : "say";
-    send(String(r.text||"").slice(0,200), responder, mode);
+    send(String(r.text||"").slice(0,200), p.charId, mode, {ai:true});
   }catch(e){
-    hint.textContent = "🤖 The cast lost its train of thought — try again.";
+    hint.textContent = "🤖 " + getArt(p.charId).name + " lost their train of thought (" +
+                       String(e.message||e).slice(0,80) + ")";
   }finally{
-    aiBusy = false;
-    setTimeout(updateRuleHint, 1500);
+    p.busy = false;
+    setTimeout(updateRuleHint, 2500);
   }
-}
-{
-  const box = document.getElementById("aibox");
-  if(box) box.hidden = !aiAvailable();
 }
 
 /* ================================= demo ================================== */
@@ -635,6 +683,160 @@ document.getElementById("save").onclick = async ()=>{
   a.href = cv.toDataURL("image/png");
   a.click();
 };
+
+/* ============================ DOM modal system =========================== */
+function ccModal(title, bodyHTML){
+  const old = document.getElementById("ccmodal");
+  if(old) old.remove();
+  const ov = document.createElement("div");
+  ov.id = "ccmodal";
+  ov.innerHTML = `<div class="mwin"><div class="mtitle">${esc(title)}
+    <button class="mclose">×</button></div><div class="mbody">${bodyHTML}</div></div>`;
+  document.body.appendChild(ov);
+  const close = ()=>ov.remove();
+  ov.querySelector(".mclose").onclick = close;
+  ov.addEventListener("pointerdown", ev=>{ if(ev.target === ov) close(); });
+  return {el: ov, close};
+}
+function copyText(t){
+  try{
+    const ta = document.createElement("textarea");
+    ta.value = t; document.body.appendChild(ta);
+    ta.select(); document.execCommand("copy"); ta.remove();
+    return true;
+  }catch(e){ return false; }
+}
+
+/* ========================= multiplayer UI wiring ========================= */
+function enterRoomMode(){
+  // shared strips reference the original cast ids, so everyone plays with it
+  if(HAVE_ORIGINAL && state.style !== "original"){
+    artsel.value = "original"; artsel.onchange();
+  }
+  document.getElementById("demo").disabled = true;
+  document.getElementById("clear").disabled = !NET.isHost;
+  document.getElementById("clear").title = NET.isHost ? "" : "Only the host can clear the shared strip";
+}
+function leaveRoomMode(){
+  document.getElementById("demo").disabled = false;
+  document.getElementById("clear").disabled = false;
+  document.getElementById("clear").title = "";
+}
+function rosterHTML(parts){
+  if(!parts || !parts.length) return "";
+  return "<div class='mrow'><b>In the room:</b> " +
+    parts.map(p=>esc(p.name) + (p.ai ? " 🤖" : "") +
+      " <span class='small'>(" + esc(getArt(p.charId) ? getArt(p.charId).name : "?") + ")</span>").join(" · ") +
+    "</div>";
+}
+let lastRoster = [];
+if(typeof NET !== "undefined"){
+  NET.onStatus = t=>{ const el = document.getElementById("netstatus"); if(el) el.textContent = t; };
+  NET.onRoster = parts=>{
+    lastRoster = parts;
+    const box = document.getElementById("mroster");
+    if(box) box.innerHTML = rosterHTML(parts);
+  };
+}
+function openNetModal(){
+  const joined = netActive();
+  const hashJoin = (location.hash.match(/#join=([\w-]+)/)||[])[1] || "";
+  let body;
+  if(joined){
+    body = `<div class="mrow">Room code: <code>${esc(NET.roomId||"")}</code>
+        <button id="mcopy">Copy invite link</button> <span id="mcopied" class="small"></span></div>
+      <div id="mroster">${rosterHTML(lastRoster)}</div>
+      <div class="mrow"><button id="mleave">Leave room</button></div>
+      <div class="small">Messages travel peer-to-peer (WebRTC). The host's browser keeps the
+      strip in order — if the host leaves, the room closes.</div>`;
+  } else {
+    body = `<div class="mrow">Your name: <input id="mname" maxlength="24" value="${esc(localStorage.getItem("comicchat-name")||"")}" placeholder="e.g. Ken"></div>
+      <div class="mrow"><button id="mhost"><b>Host a new room</b></button>
+        — then send the invite link to friends.</div>
+      <div class="mrow"><input id="mcode" placeholder="room code, e.g. cc-x7k2mp" value="${esc(hashJoin)}" style="width:14em">
+        <button id="mjoin"><b>Join</b></button></div>
+      <div id="mroster"></div>
+      <div class="small">No account, no server of ours: WebRTC with a public signalling
+      broker. Both sides need this page open in a browser.</div>`;
+  }
+  const m = ccModal("🌐 Multiplayer", body);
+  const nameOf = ()=>{
+    const v = (m.el.querySelector("#mname") ? m.el.querySelector("#mname").value : "").trim() || "Player";
+    try{ localStorage.setItem("comicchat-name", v); }catch(e){}
+    return v;
+  };
+  if(joined){
+    m.el.querySelector("#mcopy").onclick = ()=>{
+      const link = location.href.split("#")[0] + "#join=" + NET.roomId;
+      m.el.querySelector("#mcopied").textContent = copyText(link) ? "copied!" : link;
+    };
+    m.el.querySelector("#mleave").onclick = ()=>{ netLeave(); leaveRoomMode(); m.close(); };
+  } else {
+    m.el.querySelector("#mhost").onclick = ()=>{
+      netHost(nameOf(), ()=>{ enterRoomMode(); m.close(); openNetModal(); });
+      m.el.querySelector("#mhost").textContent = "connecting…";
+    };
+    m.el.querySelector("#mjoin").onclick = ()=>{
+      const code = m.el.querySelector("#mcode").value.trim();
+      if(!code) return;
+      netJoin(code, nameOf(), ()=>{ enterRoomMode(); m.close(); openNetModal(); });
+      m.el.querySelector("#mjoin").textContent = "connecting…";
+    };
+  }
+}
+
+/* ============================ AI setup wiring ============================ */
+function openAiModal(){
+  const players = window.AI_PLAYERS;
+  const chars = castIds().map(id=>`<option value="${id}">${esc(getArt(id).name)}</option>`).join("");
+  const list = players.length
+    ? players.map((p,i)=>`<div class="mrow">🤖 <b>${esc(p.name)}</b> plays ${esc(getArt(p.charId).name)}
+        ${p.chatty ? "(chatty)" : "(replies when addressed)"}
+        <button data-rm="${i}">remove</button></div>`).join("")
+    : `<div class="mrow small">No AI players yet.</div>`;
+  const m = ccModal("🤖 AI players", `
+    <div class="mrow">Anthropic API key:
+      <input id="mkey" type="password" style="width:16em" value="${esc(aiKey())}" placeholder="sk-ant-…">
+      <button id="mkeysave">Save</button> <span id="mkeynote" class="small"></span></div>
+    <div class="small mrow">The key stays in this browser's storage and is sent only to
+      api.anthropic.com — never to other players. Calls are made from whoever added the
+      AI player, so only you need a key.</div>
+    <hr>${list}
+    <div class="mrow">Add: <select id="mchar">${chars}</select>
+      <label><input type="checkbox" id="mchatty"> chatty (replies even when not addressed)</label>
+      <button id="madd"><b>Add AI player</b></button></div>
+    <div class="small">An AI player answers when someone mentions its character's name.
+      Its replies use your key and appear to everyone in the room.</div>`);
+  m.el.querySelector("#mkeysave").onclick = ()=>{
+    aiSetKey(m.el.querySelector("#mkey").value.trim());
+    m.el.querySelector("#mkeynote").textContent = aiKey() ? "saved" : "cleared";
+  };
+  m.el.querySelectorAll("[data-rm]").forEach(b=> b.onclick = ()=>{
+    players.splice(+b.dataset.rm, 1); aiPersistPlayers(); m.close(); openAiModal();
+  });
+  m.el.querySelector("#madd").onclick = ()=>{
+    aiSetKey(m.el.querySelector("#mkey").value.trim() || aiKey());
+    if(!aiKey()){ m.el.querySelector("#mkeynote").textContent = "an API key is needed first"; return; }
+    const charId = m.el.querySelector("#mchar").value;
+    players.push({name: getArt(charId).name + " (AI)", charId,
+                  chatty: m.el.querySelector("#mchatty").checked, busy:false});
+    aiPersistPlayers();
+    if(typeof netAnnounceAI === "function" && netActive()) netAnnounceAI();
+    m.close(); openAiModal();
+  };
+}
+
+{
+  const nb = document.getElementById("netbtn");
+  if(nb){
+    if(typeof netAvailable === "function" && netAvailable()) nb.onclick = openNetModal;
+    else nb.style.display = "none";
+  }
+  const ab = document.getElementById("aibtn");
+  if(ab) ab.onclick = openAiModal;
+  if(location.hash.startsWith("#join=") && typeof netAvailable === "function" && netAvailable())
+    openNetModal();
+}
 
 ensureCast();
 renderRoster();

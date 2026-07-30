@@ -43,6 +43,28 @@
         border:2px solid; border-color:var(--dk) var(--lt) var(--lt) var(--dk); }
   .help{ font-size:10px; color:#444; }
   .note{ font-size:10px; color:#7a0000; }
+  #ccmodal{
+    position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:50;
+    display:flex; align-items:center; justify-content:center;
+  }
+  #ccmodal .mwin{
+    background:var(--face); min-width:320px; max-width:560px; max-height:85vh; overflow:auto;
+    border:2px solid; border-color:var(--lt) var(--dk) var(--dk) var(--lt);
+    box-shadow:3px 3px 10px rgba(0,0,0,.5);
+  }
+  #ccmodal .mtitle{
+    background:linear-gradient(90deg,#000080,#1084d0); color:#fff; font-weight:bold;
+    font-size:13px; padding:4px 8px; display:flex; justify-content:space-between; align-items:center;
+  }
+  #ccmodal .mclose{ padding:0 7px; font-weight:bold; }
+  #ccmodal .mbody{ padding:12px 14px; font-size:12px; }
+  #ccmodal .mrow{ margin:8px 0; }
+  #ccmodal input[type=text], #ccmodal input[type=password], #ccmodal input:not([type]){
+    font-family:inherit; font-size:12px; padding:3px 6px; background:#fff;
+    border:2px solid; border-color:var(--dk) var(--lt) var(--lt) var(--dk);
+  }
+  #ccmodal .small{ font-size:10px; color:#444; }
+  #ccmodal hr{ border:none; border-top:1px solid var(--dk); margin:10px 0; }
 </style>
 </head>
 <body>
@@ -62,6 +84,9 @@
     <button id="save">💾 Save PNG</button>
     <button id="clear">🗑 Clear</button>
     <span id="dropzone"><button onclick="document.getElementById('artfile').click()">🎨 Load original artwork…</button><input type="file" id="artfile" accept=".json,application/json" hidden></span>
+    <button id="netbtn">🌐 Multiplayer</button>
+    <button id="aibtn">🤖 AI players</button>
+    <span class="help" id="netstatus"></span>
     <span class="help" id="statusnote" style="margin-left:auto"></span>
   </div>
   <div id="page"><div id="strip"><div class="hint">Pick a character, set an emotion on the wheel, and say something…</div></div></div>
@@ -80,7 +105,6 @@
         <button class="tog" data-mode="think">💭 Think</button>
         <button class="tog" data-mode="whisper">🤫 Whisper</button>
         <button class="tog" data-mode="action">🎬 Action</button>
-        <label id="aibox" hidden><input type="checkbox" id="aitoggle" checked> 🤖 Cast replies</label>
         <span class="help">Shouting isn't a balloon — type in CAPS or pick Shout on the wheel.</span>
       </div>
       <div class="sendrow">
@@ -97,6 +121,8 @@
 <script src="art-modern.js"></script>
 <script src="art-builder.js"></script>
 <script src="art-original.js?v=7" onerror="window.__noOriginal=1"></script>
+<script src="peerjs.min.js"></script>
+<script src="net.js"></script>
 <script src="app.js"></script>
 
 </body>
