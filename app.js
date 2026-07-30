@@ -676,6 +676,7 @@ Recent strip:
 ${cast}
 
 Write ${art.name}'s next line. Playful and funny, 1-2 short sentences, stay in character, react to what was just said.
+Plain text only — no markdown, no asterisks or other emphasis marks (the comic lettering has no bold or italics).
 
 Reply with ONLY this JSON, nothing else:
 {"text":"...","emotion":"neutral|happy|coy|bored|scared|sad|angry|shout|laugh","intensity":0.7,"mode":"say|think|whisper|action"}
@@ -685,6 +686,7 @@ For mode "action", "text" is a third-person action phrase WITHOUT the name (e.g.
    always when addressed by name, or (if marked chatty) when the message
    addressed nobody in particular. AI players never answer other AIs, so two
    of them can't chain-react forever. */
+const AI_ADHOC = {};   // stand-ins for addressed-but-unclaimed characters
 function aiObserve(msg){
   if(msg.ai || !aiAvailable()) return;
   for(const p of window.AI_PLAYERS){
@@ -693,6 +695,33 @@ function aiObserve(msg){
                       checkWord(msg.text.toLowerCase(), getArt(p.charId).name.toLowerCase());
     if(addressed || (p.chatty && !(msg.talkTos||[]).length)) aiReplyAs(p);
   }
+  /* A character addressed by name who is played by nobody — no human, no AI
+     player — answers for themselves. In a room only the host's machine does
+     this, so the reply happens exactly once. */
+  if(AI_CFG.autoCast === false) return;
+  if(typeof netActive === "function" && netActive() && !NET.isHost) return;
+  const claimed = new Set([msg.charId, curChar]);
+  for(const p of window.AI_PLAYERS) claimed.add(p.charId);
+  for(const r of lastRoster) claimed.add(r.charId);
+  for(const id of (msg.talkTos||[])){
+    if(claimed.has(id) || !getArt(id)) continue;
+    const p = AI_ADHOC[id] ||
+      (AI_ADHOC[id] = {name: getArt(id).name + " (AI)", charId:id, chatty:false, busy:false});
+    if(!p.busy) aiReplyAs(p);
+  }
+}
+
+/* AI replies must land as plain comic-balloon text, not markdown */
+function stripMarkdown(s){
+  return s
+    .replace(/```[a-z]*\n?/gi, "").replace(/```/g, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*\n]+)\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/\b_([^_\n]+)_\b/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#+\s*/gm, "")
+    .replace(/\s+/g, " ").trim();
 }
 async function aiReplyAs(p){
   p.busy = true;
@@ -708,7 +737,7 @@ async function aiReplyAs(p){
       ? {emotion: wheelEntry.em, intensity: Math.max(0.25, Math.min(1, +r.intensity || 0.7)), touched:true}
       : {emotion: EM.HAPPY, intensity: 0, touched:true};
     const mode = ["say","think","whisper","action"].includes(r.mode) ? r.mode : "say";
-    send(String(r.text||"").slice(0,200), p.charId, mode, {ai:true});
+    send(stripMarkdown(String(r.text||"")).slice(0,200), p.charId, mode, {ai:true});
   }catch(e){
     hint.textContent = "🤖 " + getArt(p.charId).name + " lost their train of thought (" +
                        String(e.message||e).slice(0,80) + ")";
@@ -910,7 +939,14 @@ function openAiModal(){
       <label><input type="checkbox" id="mchatty"> chatty (replies even when not addressed)</label>
       <button id="madd"><b>Add AI player</b></button></div>
     <div class="small">An AI player answers when someone mentions its character's name.
-      Its replies use your key and appear to everyone in the room.</div>`);
+      Its replies use your key and appear to everyone in the room.</div>
+    <div class="mrow"><label><input type="checkbox" id="mauto"${AI_CFG.autoCast===false?"":" checked"}>
+      Unclaimed characters answer for themselves when addressed</label>
+      <span class="small">(in a room, the host's AI does the talking)</span></div>`);
+  m.el.querySelector("#mauto").onchange = ()=>{
+    AI_CFG.autoCast = m.el.querySelector("#mauto").checked;
+    aiPersistCfg();
+  };
   const readFields = ()=>{
     if(AI_CFG.provider !== "nano"){
       AI_CFG.models[AI_CFG.provider] = m.el.querySelector("#mmodel").value.trim();
