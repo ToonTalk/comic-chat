@@ -529,39 +529,65 @@ const AI_BIOS = {
   jordan:   "cool and mysterious; says little, means much",
   connor:   "an odd knight-ish figure; formal, chivalrous, slightly out of era"
 };
-/* ---- Claude API with a user-supplied key (static-page deployment) ---- */
-const AI_MODELS = ["claude-sonnet-5", "claude-haiku-4-5-20251001"];
-function aiKey(){ try{ return localStorage.getItem("comicchat-apikey") || ""; }catch(e){ return ""; } }
-function aiSetKey(k){ try{ if(k) localStorage.setItem("comicchat-apikey", k); else localStorage.removeItem("comicchat-apikey"); }catch(e){} }
+/* ---- AI with a user-supplied key: Claude, ChatGPT, or Gemini ---- */
+/* Defaults are each provider's current small ("mini") model as of July 2026;
+   the model field is editable, and a model-shaped error falls back once to a
+   long-lived known-good id so a stale default never breaks every call. */
+const AI_PROVIDERS = {
+  claude: {label:"Claude (Anthropic)", model:"claude-haiku-4-5-20251001", fallback:"claude-sonnet-5",   keyHint:"sk-ant-…"},
+  openai: {label:"ChatGPT (OpenAI)",   model:"gpt-5.4-mini",              fallback:"gpt-5-mini",        keyHint:"sk-…"},
+  gemini: {label:"Gemini (Google)",    model:"gemini-3.6-flash",          fallback:"gemini-2.5-flash",  keyHint:"AIza…"}
+};
+let AI_CFG = {provider:"claude", models:{}, keys:{}};
+try{
+  const c = JSON.parse(localStorage.getItem("comicchat-ai-cfg"));
+  if(c && AI_PROVIDERS[c.provider]) AI_CFG = {provider:c.provider, models:c.models||{}, keys:c.keys||{}};
+  const legacy = localStorage.getItem("comicchat-apikey");   // pre-provider versions
+  if(legacy && !AI_CFG.keys.claude){ AI_CFG.keys.claude = legacy; localStorage.removeItem("comicchat-apikey"); }
+}catch(e){}
+function aiPersistCfg(){ try{ localStorage.setItem("comicchat-ai-cfg", JSON.stringify(AI_CFG)); }catch(e){} }
+function aiKey(){ return AI_CFG.keys[AI_CFG.provider] || ""; }
+function aiModel(){ return (AI_CFG.models[AI_CFG.provider] || "").trim() || AI_PROVIDERS[AI_CFG.provider].model; }
 function aiAvailable(){ return !!aiKey(); }
 
-async function fetchClaude(prompt){
-  let lastErr = null;
-  for(const model of AI_MODELS){
-    try{
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": aiKey(),
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          "anthropic-dangerous-direct-browser-access": "true"
-        },
-        body: JSON.stringify({model, max_tokens: 300,
-          messages: [{role:"user", content: prompt}]})
-      });
-      if(!res.ok){
-        const body = await res.text();
-        // an unknown-model error should fall through to the next model id;
-        // anything else (bad key, quota) is fatal for both
-        if(res.status === 404 || /model/i.test(body)) { lastErr = new Error(body.slice(0,200)); continue; }
-        throw new Error("API " + res.status + ": " + body.slice(0,200));
-      }
-      const data = await res.json();
-      return (data.content && data.content[0] && data.content[0].text) || "";
-    }catch(e){ lastErr = e; if(!/model/i.test(String(e))) break; }
+async function callProvider(provider, model, prompt){
+  const key = AI_CFG.keys[provider];
+  let url, headers, body, pick;
+  if(provider === "claude"){
+    url = "https://api.anthropic.com/v1/messages";
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01",
+               "content-type": "application/json",
+               "anthropic-dangerous-direct-browser-access": "true"};
+    body = {model, max_tokens: 300, messages: [{role:"user", content: prompt}]};
+    pick = d => (d.content && d.content[0] && d.content[0].text) || "";
+  } else if(provider === "openai"){
+    url = "https://api.openai.com/v1/chat/completions";
+    headers = {"authorization": "Bearer " + key, "content-type": "application/json"};
+    body = {model, messages: [{role:"user", content: prompt}]};
+    pick = d => (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || "";
+  } else {
+    url = "https://generativelanguage.googleapis.com/v1beta/models/" +
+          encodeURIComponent(model) + ":generateContent";
+    headers = {"x-goog-api-key": key, "content-type": "application/json"};
+    body = {contents: [{parts: [{text: prompt}]}]};
+    pick = d => {
+      const parts = d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts;
+      return parts ? parts.map(p=>p.text||"").join("") : "";
+    };
   }
-  throw lastErr || new Error("no model worked");
+  const res = await fetch(url, {method:"POST", headers, body: JSON.stringify(body)});
+  if(!res.ok) throw new Error("API " + res.status + ": " + (await res.text()).slice(0,200));
+  return pick(await res.json());
+}
+async function fetchAI(prompt){
+  const p = AI_CFG.provider;
+  try{
+    return await callProvider(p, aiModel(), prompt);
+  }catch(e){
+    if(/model/i.test(String(e)) && aiModel() !== AI_PROVIDERS[p].fallback)
+      return await callProvider(p, AI_PROVIDERS[p].fallback, prompt);
+    throw e;
+  }
 }
 
 /* ---- AI participants: characters played by Claude with YOUR key ---- */
@@ -610,7 +636,7 @@ async function aiReplyAs(p){
   const hint = document.getElementById("rulehint");
   hint.textContent = `💭 ${getArt(p.charId).name} is thinking…`;
   try{
-    const raw = await fetchClaude(aiPrompt(p.charId));
+    const raw = await fetchAI(aiPrompt(p.charId));
     const m = raw.match(/\{[\s\S]*\}/);
     const r = JSON.parse(m ? m[0] : raw);
     const emoKey = String(r.emotion||"neutral").toLowerCase();
@@ -738,6 +764,13 @@ if(typeof NET !== "undefined"){
     if(box) box.innerHTML = rosterHTML(parts);
   };
 }
+/* Accept a bare code, a pasted invite URL (file:///...#join=cc-xxxxxx), or
+   anything containing a cc- code — extract the room id from all of them. */
+function parseRoomCode(s){
+  s = (s||"").trim();
+  const m = s.match(/#?join=([\w-]+)/i) || s.match(/\b(cc-[a-z0-9]+)\b/i);
+  return m ? m[1] : s;
+}
 function openNetModal(){
   const joined = netActive();
   const hashJoin = (location.hash.match(/#join=([\w-]+)/)||[])[1] || "";
@@ -777,8 +810,9 @@ function openNetModal(){
       m.el.querySelector("#mhost").textContent = "connecting…";
     };
     m.el.querySelector("#mjoin").onclick = ()=>{
-      const code = m.el.querySelector("#mcode").value.trim();
+      const code = parseRoomCode(m.el.querySelector("#mcode").value);
       if(!code) return;
+      m.el.querySelector("#mcode").value = code;
       netJoin(code, nameOf(), ()=>{ enterRoomMode(); m.close(); openNetModal(); });
       m.el.querySelector("#mjoin").textContent = "connecting…";
     };
@@ -794,28 +828,47 @@ function openAiModal(){
         ${p.chatty ? "(chatty)" : "(replies when addressed)"}
         <button data-rm="${i}">remove</button></div>`).join("")
     : `<div class="mrow small">No AI players yet.</div>`;
+  const provOpts = Object.keys(AI_PROVIDERS).map(k=>
+    `<option value="${k}"${k===AI_CFG.provider?" selected":""}>${esc(AI_PROVIDERS[k].label)}</option>`).join("");
   const m = ccModal("🤖 AI players", `
-    <div class="mrow">Anthropic API key:
-      <input id="mkey" type="password" style="width:16em" value="${esc(aiKey())}" placeholder="sk-ant-…">
+    <div class="mrow">Provider: <select id="mprov">${provOpts}</select>
+      &nbsp; Model: <input id="mmodel" style="width:14em" value="${esc(aiModel())}"></div>
+    <div class="mrow">API key:
+      <input id="mkey" type="password" style="width:16em" value="${esc(aiKey())}" placeholder="${esc(AI_PROVIDERS[AI_CFG.provider].keyHint)}">
       <button id="mkeysave">Save</button> <span id="mkeynote" class="small"></span></div>
-    <div class="small mrow">The key stays in this browser's storage and is sent only to
-      api.anthropic.com — never to other players. Calls are made from whoever added the
-      AI player, so only you need a key.</div>
+    <div class="small mrow">The key stays in this browser's storage and goes only to the
+      provider you chose — never to other players. Calls are made from whoever added the
+      AI player, so only you need a key. The model box is prefilled with the provider's
+      current small model; edit it to use any model your key can access.</div>
     <hr>${list}
     <div class="mrow">Add: <select id="mchar">${chars}</select>
       <label><input type="checkbox" id="mchatty"> chatty (replies even when not addressed)</label>
       <button id="madd"><b>Add AI player</b></button></div>
     <div class="small">An AI player answers when someone mentions its character's name.
       Its replies use your key and appear to everyone in the room.</div>`);
+  const readFields = ()=>{
+    AI_CFG.models[AI_CFG.provider] = m.el.querySelector("#mmodel").value.trim();
+    AI_CFG.keys[AI_CFG.provider] = m.el.querySelector("#mkey").value.trim();
+    aiPersistCfg();
+  };
+  m.el.querySelector("#mprov").onchange = ()=>{
+    readFields();
+    AI_CFG.provider = m.el.querySelector("#mprov").value;
+    aiPersistCfg();
+    m.el.querySelector("#mmodel").value = aiModel();
+    m.el.querySelector("#mkey").value = aiKey();
+    m.el.querySelector("#mkey").placeholder = AI_PROVIDERS[AI_CFG.provider].keyHint;
+    m.el.querySelector("#mkeynote").textContent = "";
+  };
   m.el.querySelector("#mkeysave").onclick = ()=>{
-    aiSetKey(m.el.querySelector("#mkey").value.trim());
+    readFields();
     m.el.querySelector("#mkeynote").textContent = aiKey() ? "saved" : "cleared";
   };
   m.el.querySelectorAll("[data-rm]").forEach(b=> b.onclick = ()=>{
     players.splice(+b.dataset.rm, 1); aiPersistPlayers(); m.close(); openAiModal();
   });
   m.el.querySelector("#madd").onclick = ()=>{
-    aiSetKey(m.el.querySelector("#mkey").value.trim() || aiKey());
+    readFields();
     if(!aiKey()){ m.el.querySelector("#mkeynote").textContent = "an API key is needed first"; return; }
     const charId = m.el.querySelector("#mchar").value;
     players.push({name: getArt(charId).name + " (AI)", charId,
