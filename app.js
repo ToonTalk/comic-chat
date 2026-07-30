@@ -581,8 +581,18 @@ const NANO_SCHEMA = {type:"object", properties:{
   intensity:{type:"number"},
   mode:{type:"string", enum:["say","think","whisper","action"]}
 }, required:["text","emotion","intensity","mode"]};
+/* Chrome asks for the output language to be declared ("No output language was
+   specified…"); older builds reject the options object, hence the fallback. */
+const NANO_LANG = {
+  expectedInputs:  [{type:"text", languages:["en"]}],
+  expectedOutputs: [{type:"text", languages:["en"]}]
+};
+async function nanoCreate(extraOpts){
+  try{ return await NANO.api.create(Object.assign({}, NANO_LANG, extraOpts||{})); }
+  catch(e){ return await NANO.api.create(extraOpts||{}); }
+}
 async function nanoPrompt(prompt){
-  const sess = await NANO.api.create();
+  const sess = await nanoCreate();
   try{
     try{ return await sess.prompt(prompt, {responseConstraint: NANO_SCHEMA}); }
     catch(e){ return await sess.prompt(prompt); }    // constraint unsupported on this build
@@ -591,7 +601,7 @@ async function nanoPrompt(prompt){
   }
 }
 async function nanoDownload(onProgress){
-  const sess = await NANO.api.create({monitor(m){
+  const sess = await nanoCreate({monitor(m){
     m.addEventListener("downloadprogress", e=>{
       if(onProgress) onProgress(Math.round((e.loaded || 0) * 100));
     });
@@ -731,17 +741,36 @@ function stripMarkdown(s){
     .replace(/\s+/g, " ").trim();
 }
 /* one generation attempt; returns null if the model parroted the format
-   template ("...", the example sentence, or nothing) instead of writing a line */
+   template ("...", the example sentence, or nothing) instead of writing a line.
+   Parsing is three-tier: full JSON, then a "text" field fished out of broken
+   JSON (truncation), then the whole reply treated as the spoken line — small
+   on-device models often answer in prose despite the instructions, and prose
+   is a perfectly good balloon. */
 async function aiAttempt(p, extra){
   const raw = await fetchAI(aiPrompt(p.charId) + (extra || ""));
+  let r = null, text = "";
   const m = raw.match(/\{[\s\S]*\}/);
-  const r = JSON.parse(m ? m[0] : raw);
-  const text = stripMarkdown(String(r.text||"")).trim();
-  const parroted = !text ||
+  if(m){ try{ r = JSON.parse(m[0]); }catch(e){} }
+  if(r){
+    text = stripMarkdown(String(r.text||"")).trim();
+  } else {
+    // the char class stops at any unescaped quote, so the close-quote itself
+    // is optional — truncated output loses it
+    const tf = raw.match(/"text"\s*:\s*"((?:[^"\\]|\\.)+)/);
+    text = stripMarkdown(tf ? tf[1].replace(/\\(.)/g, "$1")
+                            : raw.replace(/^["'\s]+|["'\s]+$/g, "")).trim();
+    r = {emotion:"neutral", intensity:0.5, mode:"say"};
+  }
+  const parroted = !text || text.startsWith("{") ||             // JSON junk is not dialogue
+    /^[.…\s]+$/.test(text) ||
     /^[.…\s]+$/.test(text) ||                                   // "...", "…"
     text.toLowerCase().replace(/[^a-z ]/g,"") ===
       AI_EXAMPLE.toLowerCase().replace(/[^a-z ]/g,"");
-  return parroted ? null : {r, text};
+  if(parroted){
+    console.warn("Comic Chat AI: unusable reply from model:", raw);
+    return null;
+  }
+  return {r, text};
 }
 async function aiReplyAs(p){
   p.busy = true;
