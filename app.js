@@ -538,19 +538,81 @@ const AI_PROVIDERS = {
   openai: {label:"ChatGPT (OpenAI)",   model:"gpt-5.4-mini",              fallback:"gpt-5-mini",        keyHint:"sk-…"},
   gemini: {label:"Gemini (Google)",    model:"gemini-3.6-flash",          fallback:"gemini-2.5-flash",  keyHint:"AIza…"}
 };
-let AI_CFG = {provider:"claude", models:{}, keys:{}};
+let AI_CFG = {provider:"claude", models:{}, keys:{}, chosen:false};
 try{
   const c = JSON.parse(localStorage.getItem("comicchat-ai-cfg"));
-  if(c && AI_PROVIDERS[c.provider]) AI_CFG = {provider:c.provider, models:c.models||{}, keys:c.keys||{}};
+  if(c && (AI_PROVIDERS[c.provider] || c.provider === "nano"))
+    AI_CFG = {provider:c.provider, models:c.models||{}, keys:c.keys||{}, chosen:!!c.chosen};
   const legacy = localStorage.getItem("comicchat-apikey");   // pre-provider versions
   if(legacy && !AI_CFG.keys.claude){ AI_CFG.keys.claude = legacy; localStorage.removeItem("comicchat-apikey"); }
 }catch(e){}
+
+/* ---- Gemini Nano, built into Chrome (the Prompt API) ----
+   Feature-detected: the LanguageModel global (Chrome 138+), with the older
+   window.ai.languageModel shape as fallback. When the on-device model is
+   ready it becomes an AI provider needing NO key, and the default — unless
+   the user has explicitly picked a provider themselves. */
+const NANO = {state:"unsupported", api:null, legacy:false};
+async function nanoDetect(){
+  try{
+    if(typeof LanguageModel !== "undefined" && LanguageModel.availability){
+      NANO.api = LanguageModel;
+      NANO.state = await LanguageModel.availability();
+    } else if(window.ai && window.ai.languageModel && window.ai.languageModel.capabilities){
+      NANO.api = window.ai.languageModel; NANO.legacy = true;
+      const c = await window.ai.languageModel.capabilities();
+      NANO.state = c.available === "readily" ? "available"
+                 : c.available === "after-download" ? "downloadable" : "unavailable";
+    }
+  }catch(e){ NANO.state = "unavailable"; }
+  if(NANO.state === "available" || NANO.state === "downloadable" || NANO.state === "downloading"){
+    AI_PROVIDERS.nano = {label:"Gemini Nano (built into Chrome, no key)",
+                         model:"on-device", fallback:null, keyHint:"", local:true};
+    if(NANO.state === "available" && !AI_CFG.chosen){
+      AI_CFG.provider = "nano"; aiPersistCfg();
+    }
+  } else if(AI_CFG.provider === "nano"){
+    AI_CFG.provider = "claude";       // saved on a machine that had it; this one doesn't
+  }
+}
+const NANO_SCHEMA = {type:"object", properties:{
+  text:{type:"string"},
+  emotion:{type:"string", enum:["neutral","happy","coy","bored","scared","sad","angry","shout","laugh"]},
+  intensity:{type:"number"},
+  mode:{type:"string", enum:["say","think","whisper","action"]}
+}, required:["text","emotion","intensity","mode"]};
+async function nanoPrompt(prompt){
+  const sess = await NANO.api.create();
+  try{
+    try{ return await sess.prompt(prompt, {responseConstraint: NANO_SCHEMA}); }
+    catch(e){ return await sess.prompt(prompt); }    // constraint unsupported on this build
+  }finally{
+    try{ if(sess.destroy) sess.destroy(); }catch(e){}
+  }
+}
+async function nanoDownload(onProgress){
+  const sess = await NANO.api.create({monitor(m){
+    m.addEventListener("downloadprogress", e=>{
+      if(onProgress) onProgress(Math.round((e.loaded || 0) * 100));
+    });
+  }});
+  try{ if(sess.destroy) sess.destroy(); }catch(e){}
+  NANO.state = "available";
+}
+nanoDetect();
 function aiPersistCfg(){ try{ localStorage.setItem("comicchat-ai-cfg", JSON.stringify(AI_CFG)); }catch(e){} }
 function aiKey(){ return AI_CFG.keys[AI_CFG.provider] || ""; }
-function aiModel(){ return (AI_CFG.models[AI_CFG.provider] || "").trim() || AI_PROVIDERS[AI_CFG.provider].model; }
-function aiAvailable(){ return !!aiKey(); }
+function aiModel(){
+  if(AI_CFG.provider === "nano") return "on-device";
+  return (AI_CFG.models[AI_CFG.provider] || "").trim() || AI_PROVIDERS[AI_CFG.provider].model;
+}
+function aiAvailable(){
+  if(AI_CFG.provider === "nano") return NANO.state === "available";
+  return !!aiKey();
+}
 
 async function callProvider(provider, model, prompt){
+  if(provider === "nano") return nanoPrompt(prompt);
   const key = AI_CFG.keys[provider];
   let url, headers, body, pick;
   if(provider === "claude"){
@@ -584,8 +646,9 @@ async function fetchAI(prompt){
   try{
     return await callProvider(p, aiModel(), prompt);
   }catch(e){
-    if(/model/i.test(String(e)) && aiModel() !== AI_PROVIDERS[p].fallback)
-      return await callProvider(p, AI_PROVIDERS[p].fallback, prompt);
+    const fb = AI_PROVIDERS[p] && AI_PROVIDERS[p].fallback;
+    if(fb && /model/i.test(String(e)) && aiModel() !== fb)
+      return await callProvider(p, fb, prompt);
     throw e;
   }
 }
@@ -832,11 +895,13 @@ function openAiModal(){
     `<option value="${k}"${k===AI_CFG.provider?" selected":""}>${esc(AI_PROVIDERS[k].label)}</option>`).join("");
   const m = ccModal("🤖 AI players", `
     <div class="mrow">Provider: <select id="mprov">${provOpts}</select>
-      &nbsp; Model: <input id="mmodel" style="width:14em" value="${esc(aiModel())}"></div>
-    <div class="mrow">API key:
+      <span id="mmodelrow">&nbsp; Model: <input id="mmodel" style="width:14em" value="${esc(aiModel())}"></span></div>
+    <div class="mrow" id="mkeyrow">API key:
       <input id="mkey" type="password" style="width:16em" value="${esc(aiKey())}" placeholder="${esc(AI_PROVIDERS[AI_CFG.provider].keyHint)}">
       <button id="mkeysave">Save</button> <span id="mkeynote" class="small"></span></div>
-    <div class="small mrow">The key stays in this browser's storage and goes only to the
+    <div class="mrow" id="mnanorow" style="display:none"><span id="mnanostate"></span>
+      <button id="mnanodl" style="display:none">Download model</button></div>
+    <div class="small mrow" id="mkeyhelp">The key stays in this browser's storage and goes only to the
       provider you chose — never to other players. Calls are made from whoever added the
       AI player, so only you need a key. The model box is prefilled with the provider's
       current small model; edit it to use any model your key can access.</div>
@@ -847,18 +912,53 @@ function openAiModal(){
     <div class="small">An AI player answers when someone mentions its character's name.
       Its replies use your key and appear to everyone in the room.</div>`);
   const readFields = ()=>{
-    AI_CFG.models[AI_CFG.provider] = m.el.querySelector("#mmodel").value.trim();
-    AI_CFG.keys[AI_CFG.provider] = m.el.querySelector("#mkey").value.trim();
+    if(AI_CFG.provider !== "nano"){
+      AI_CFG.models[AI_CFG.provider] = m.el.querySelector("#mmodel").value.trim();
+      AI_CFG.keys[AI_CFG.provider] = m.el.querySelector("#mkey").value.trim();
+    }
     aiPersistCfg();
   };
+  const refreshProviderRows = ()=>{
+    const isNano = AI_CFG.provider === "nano";
+    m.el.querySelector("#mmodelrow").style.display = isNano ? "none" : "";
+    m.el.querySelector("#mkeyrow").style.display = isNano ? "none" : "";
+    m.el.querySelector("#mkeyhelp").style.display = isNano ? "none" : "";
+    m.el.querySelector("#mnanorow").style.display = isNano ? "" : "none";
+    if(isNano){
+      const st = m.el.querySelector("#mnanostate");
+      const dl = m.el.querySelector("#mnanodl");
+      if(NANO.state === "available"){
+        st.textContent = "✅ Ready — runs on this machine inside Chrome, no key and no cost.";
+        dl.style.display = "none";
+      } else {
+        st.textContent = "The on-device model isn't downloaded yet (a few GB, one time).";
+        dl.style.display = "";
+        dl.onclick = async ()=>{
+          dl.disabled = true;
+          try{
+            await nanoDownload(pct=>{ st.textContent = "Downloading… " + pct + "%"; });
+            refreshProviderRows();
+          }catch(e){
+            st.textContent = "Download failed: " + String(e.message||e).slice(0,80);
+            dl.disabled = false;
+          }
+        };
+      }
+    }
+  };
+  refreshProviderRows();
   m.el.querySelector("#mprov").onchange = ()=>{
     readFields();
     AI_CFG.provider = m.el.querySelector("#mprov").value;
+    AI_CFG.chosen = true;                      // an explicit choice sticks
     aiPersistCfg();
-    m.el.querySelector("#mmodel").value = aiModel();
-    m.el.querySelector("#mkey").value = aiKey();
-    m.el.querySelector("#mkey").placeholder = AI_PROVIDERS[AI_CFG.provider].keyHint;
+    if(AI_CFG.provider !== "nano"){
+      m.el.querySelector("#mmodel").value = aiModel();
+      m.el.querySelector("#mkey").value = aiKey();
+      m.el.querySelector("#mkey").placeholder = AI_PROVIDERS[AI_CFG.provider].keyHint;
+    }
     m.el.querySelector("#mkeynote").textContent = "";
+    refreshProviderRows();
   };
   m.el.querySelector("#mkeysave").onclick = ()=>{
     readFields();
@@ -869,7 +969,14 @@ function openAiModal(){
   });
   m.el.querySelector("#madd").onclick = ()=>{
     readFields();
-    if(!aiKey()){ m.el.querySelector("#mkeynote").textContent = "an API key is needed first"; return; }
+    if(!aiAvailable()){
+      const note = AI_CFG.provider === "nano"
+        ? "download the on-device model first"
+        : "an API key is needed first";
+      (AI_CFG.provider === "nano" ? m.el.querySelector("#mnanostate")
+                                  : m.el.querySelector("#mkeynote")).textContent = note;
+      return;
+    }
     const charId = m.el.querySelector("#mchar").value;
     players.push({name: getArt(charId).name + " (AI)", charId,
                   chatty: m.el.querySelector("#mchatty").checked, busy:false});
