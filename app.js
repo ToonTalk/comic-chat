@@ -241,10 +241,12 @@ function renderAll(){
   strip.style.maxWidth = (state.wide*px + 6*(state.wide+1) + 8) + "px";
   if(!state.msgs.length){
     strip.innerHTML = `<div class="hint">Pick a character, set an emotion on the wheel, and say something…</div>`;
+    if(typeof updateThinkingPanels === "function") updateThinkingPanels();
     return;
   }
   const panels = layoutStrip(state.msgs, getArt, {title: state.title});
   strip.innerHTML = panels.map(p=>panelSvg(p, px)).join("");
+  if(typeof updateThinkingPanels === "function") updateThinkingPanels();
   const page = document.getElementById("page");
   page.scrollTop = page.scrollHeight;
 }
@@ -772,10 +774,54 @@ async function aiAttempt(p, extra){
   }
   return {r, text};
 }
+/* ---- a visible "thinking" panel while the model generates ----
+   On-device Nano can take many seconds; instead of a dead strip, the pending
+   character stands in a temporary panel with a pulsing thought bubble. These
+   panels are local-only presentation — never part of the shared message list,
+   so multiplayer layout stays deterministic. */
+const AI_THINKING = new Set();
+function thinkingPanelHTML(id, px){
+  const art = getArt(id);
+  const pose = bodyFromEmotion(art, EM.BORED, 0.35, -1);
+  const dm = art.dim ? art.dim(pose.face, pose.torso)
+                     : {x:art.nat.x, y:art.nat.y, w:art.nat.w, h:art.nat.h};
+  const h = S/BODY_H_DIV, scale = h/dm.h, w = dm.w*scale;
+  const cx = S/2;
+  const tx = cx - w/2 - dm.x*scale, ty = (S - h) - dm.y*scale;
+  const fig = `<g transform="translate(${tx.toFixed(1)},${ty.toFixed(1)}) scale(${scale.toFixed(4)})">${art.draw(pose.face,pose.torso)}</g>`;
+  const dots = [0,1,2].map(i=>
+    `<circle cx="${cx-280+i*280}" cy="880" r="95" fill="#000">`+
+    `<animate attributeName="opacity" values="0.15;1;0.15" dur="1.2s" begin="${(i*0.3).toFixed(1)}s" repeatCount="indefinite"/></circle>`).join("");
+  const cloud =
+    `<ellipse cx="${cx}" cy="880" rx="950" ry="460" fill="#fff" stroke="#000" stroke-width="28"/>`+dots+
+    `<circle cx="${cx-430}" cy="1560" r="80" fill="#fff" stroke="#000" stroke-width="26"/>`+
+    `<circle cx="${cx-560}" cy="1840" r="50" fill="#fff" stroke="#000" stroke-width="22"/>`;
+  const border = `<rect x="${BORDER_W}" y="${BORDER_W}" width="${S-2*BORDER_W}" height="${S-2*BORDER_W}" fill="none" stroke="#000" stroke-width="${2*BORDER_W}"/>`;
+  return `<svg class="panel thinkpanel" data-think="${esc(id)}" width="${px}" height="${px}" viewBox="0 0 ${S} ${S}" xmlns="http://www.w3.org/2000/svg">`+
+         `<rect width="${S}" height="${S}" fill="#fff"/>${fig}${cloud}${border}</svg>`;
+}
+function updateThinkingPanels(){
+  const strip = document.getElementById("strip");
+  strip.querySelectorAll("[data-think]").forEach(el=>{
+    if(!AI_THINKING.has(el.getAttribute("data-think"))) el.remove();
+  });
+  const px = panelPx();
+  for(const id of AI_THINKING){
+    if(!getArt(id)) continue;
+    if(!strip.querySelector(`[data-think="${id}"]`))
+      strip.insertAdjacentHTML("beforeend", thinkingPanelHTML(id, px));
+  }
+  if(AI_THINKING.size)
+    document.getElementById("page").scrollTop = document.getElementById("page").scrollHeight;
+}
+function showThinking(id){ AI_THINKING.add(id); updateThinkingPanels(); }
+function hideThinking(id){ AI_THINKING.delete(id); updateThinkingPanels(); }
+
 async function aiReplyAs(p){
   p.busy = true;
   const hint = document.getElementById("rulehint");
   hint.textContent = `💭 ${getArt(p.charId).name} is thinking…`;
+  showThinking(p.charId);
   try{
     let got = await aiAttempt(p);
     if(!got) got = await aiAttempt(p,
@@ -792,11 +838,13 @@ async function aiReplyAs(p){
       ? {emotion: wheelEntry.em, intensity: Math.max(0.25, Math.min(1, +r.intensity || 0.7)), touched:true}
       : {emotion: EM.HAPPY, intensity: 0, touched:true};
     const mode = ["say","think","whisper","action"].includes(r.mode) ? r.mode : "say";
+    hideThinking(p.charId);              // the real panel replaces the pending one
     send(got.text.slice(0,200), p.charId, mode, {ai:true});
   }catch(e){
     hint.textContent = "🤖 " + getArt(p.charId).name + " lost their train of thought (" +
                        String(e.message||e).slice(0,80) + ")";
   }finally{
+    hideThinking(p.charId);
     p.busy = false;
     setTimeout(updateRuleHint, 2500);
   }
