@@ -559,11 +559,16 @@ function layoutAvatars(panel, getArt, hyst, establishing){
 function balloonRect(){
   return {left: BORDER_W + WAVE_H, right: S - BORDER_W - WAVE_H, top: BORDER_W + WAVE_H, bottom: S/2};
 }
-/* QueryRouteRgn (balloon.cpp:1358) — keeps tails from ever crossing */
+/* QueryRouteRgn (balloon.cpp:1358) — keeps tails from ever crossing.
+   TAIL_CLEAR pads the protected anchor: the tail's two arcs bulge sideways
+   (5% of tail length) and the neighbor's own spline wobble reaches ~WAVE_H
+   outside its rect, so a balloon flush against the bare anchor still gets
+   grazed. */
+const TAIL_CLEAR = 340;
 function queryRouteRgn(b, otherToX){
   const toX = b.speakerArrowX;
-  if(otherToX > toX) return {left: Math.max(toX, b.routeRgn.left + MIN_ROUTE_W), right: Infinity};
-  return {left: -Infinity, right: Math.min(toX, b.routeRgn.right - MIN_ROUTE_W)};
+  if(otherToX > toX) return {left: Math.max(toX + TAIL_CLEAR, b.routeRgn.left + MIN_ROUTE_W), right: Infinity};
+  return {left: -Infinity, right: Math.min(toX - TAIL_CLEAR, b.routeRgn.right - MIN_ROUTE_W)};
 }
 function measureBalloon(msg, width){
   const italic = msg.mode === "whisper";
@@ -758,10 +763,15 @@ function layoutStrip(messages, getArt, opts){
     if(m.mode === "action") forceNew = true;
     let cur = panels[panels.length-1];
     const speakerInPanel = cur && !cur.title && cur.msgs.some(x=>x.charId === m.charId);
+    // A question to the room right after someone answered THIS speaker reads
+    // as if it were aimed at the answerer if they share a panel — the Q&A is
+    // a completed beat, so an undirected follow-up starts a fresh panel.
+    const closesExchange = cur && !cur.title && !(m.talkTos||[]).length &&
+                           cur.msgs.some(x=>x.replyTo === m.charId);
     let startNew = forceNew || !cur || cur.title ||
                    cur.msgs.length >= MAX_BALLOONS ||
                    panels.length < (withTitle ? 2 : 1) ||
-                   speakerInPanel;
+                   speakerInPanel || closesExchange;
 
     if(!startNew){
       // try appending: clone, re-layout the whole panel, keep only if it fits
@@ -1140,38 +1150,65 @@ function cloudPath(r){
    stays AT the speaker — the 45-degree clamp moves the MOUTH along the
    balloon's bottom edge (balloon.cpp:1466), never the apex; swinging the apex
    sideways is what made tails wander across neighboring balloons. */
-function tailPath(b, body, dashed){
+function tailPath(b, body, dashed, others){
   if(!body) return "";
   const c = b.cloud;
   const ax = body.arrowX;
   let ay = body.top - 200;
   if(ay - c.bottom < MIN_TAIL_H) ay = c.bottom + MIN_TAIL_H;
   const heightDelta = ay - c.bottom;
+  const mouthY = c.bottom - 40;                              // tucked inside the border
+  const clampMouth = x => Math.max(c.left + TAIL_MOUTH + 40, Math.min(c.right - TAIL_MOUTH - 40, x));
   let xbreak = (b.routeRgn.left + b.routeRgn.right)/2;
   if(Math.abs(ax - xbreak) > heightDelta)                    // 45° from vertical
     xbreak = ax - Math.sign(ax - xbreak) * heightDelta;
-  xbreak = Math.max(c.left + TAIL_MOUTH + 40, Math.min(c.right - TAIL_MOUTH - 40, xbreak));
-  const mouthY = c.bottom - 40;                              // tucked inside the border
-  const L = {x: xbreak - TAIL_MOUTH, y: mouthY};
-  const R = {x: xbreak + TAIL_MOUTH, y: mouthY};
-  const A = {x: ax, y: ay};
-  const alt = 0.05 * Math.hypot(ax - xbreak, ay - mouthY);
-  const sign = ax > xbreak ? 1 : -1;
+  xbreak = clampMouth(xbreak);
+
   const q = (P, Q, bulge)=>{
     const mx=(P.x+Q.x)/2, my=(P.y+Q.y)/2;
     const dx=Q.x-P.x, dy=Q.y-P.y, len=Math.hypot(dx,dy)||1;
     return {x: mx - dy/len*2*bulge, y: my + dx/len*2*bulge};
   };
-  const c1 = q(L, A,  sign*alt), c2 = q(A, R, -sign*alt);
+  // The clamps above can still route a tail alongside (or across) a sibling
+  // balloon. Sample the arcs against the siblings' clouds (inflated for the
+  // spline wobble) and escalate: normal bulge -> straight -> mouth moved as
+  // close under the speaker as the cloud allows.
+  const rects = (others||[]).filter(o=>o!==b && o.cloud && o.msg.mode!=="action")
+    .map(o=>({l:o.cloud.left-84, t:o.cloud.top-84, r:o.cloud.right+84, b:o.cloud.bottom+84}));
+  const hits = (L, A, R, c1, c2)=>{
+    if(!rects.length) return false;
+    const probe = (P, C, Q)=>{
+      for(let t=0.05; t<1; t+=0.09){
+        const x=(1-t)*(1-t)*P.x + 2*(1-t)*t*C.x + t*t*Q.x;
+        const y=(1-t)*(1-t)*P.y + 2*(1-t)*t*C.y + t*t*Q.y;
+        for(const rc of rects) if(x>rc.l && x<rc.r && y>rc.t && y<rc.b) return true;
+      }
+      return false;
+    };
+    return probe(L,c1,A) || probe(A,c2,R);
+  };
+  const build = (mx, bulgeScale)=>{
+    const L = {x: mx - TAIL_MOUTH, y: mouthY};
+    const R = {x: mx + TAIL_MOUTH, y: mouthY};
+    const A = {x: ax, y: ay};
+    const alt = Math.min(0.05 * Math.hypot(ax - mx, ay - mouthY), 120) * bulgeScale;
+    const sign = ax > mx ? 1 : -1;
+    return {L, R, A, c1: q(L, A, sign*alt), c2: q(A, R, -sign*alt)};
+  };
+  let g = build(xbreak, 1);
+  if(hits(g.L, g.A, g.R, g.c1, g.c2)){
+    g = build(xbreak, 0);                                    // straighten
+    if(hits(g.L, g.A, g.R, g.c1, g.c2)) g = build(clampMouth(ax), 0);  // drop from under the speaker
+  }
   const f = v=>v.toFixed(1);
-  const d = `M ${f(L.x)} ${f(L.y)} Q ${f(c1.x)} ${f(c1.y)} ${f(A.x)} ${f(A.y)}`+
-            ` Q ${f(c2.x)} ${f(c2.y)} ${f(R.x)} ${f(R.y)}`;
+  const d = `M ${f(g.L.x)} ${f(g.L.y)} Q ${f(g.c1.x)} ${f(g.c1.y)} ${f(g.A.x)} ${f(g.A.y)}`+
+            ` Q ${f(g.c2.x)} ${f(g.c2.y)} ${f(g.R.x)} ${f(g.R.y)}`;
   const stroke = dashed ? ` stroke-dasharray="150 90" stroke="#777"` : ` stroke="#000"`;
-  return `<path d="${d}" fill="#fff"${stroke} stroke-width="28" stroke-linejoin="round"/>`;
+  return `<path class="tail" d="${d}" fill="#fff"${stroke} stroke-width="28" stroke-linejoin="round"/>`;
 }
 function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
-function balloonSvg(b, body){
+function balloonSvg(b, body, siblings){
   const m = b.msg, c = b.cloud, pad = b.pad;
   const italic = m.mode === "whisper";
   const lines = b.text.lines;
@@ -1184,7 +1221,7 @@ function balloonSvg(b, body){
     const stroke = italic ? "#777" : "#000";
     if(italic) parts.push(`<path d="${cloudPath(c)}" fill="#fff" stroke="#fff" stroke-width="100"/>`);
     parts.push(`<path d="${cloudPath(c)}" fill="#fff" stroke="${stroke}" stroke-width="28"${dash}/>`);
-    if(m.mode !== "think") parts.push(tailPath(b, body, italic));
+    if(m.mode !== "think") parts.push(tailPath(b, body, italic, siblings));
     if(m.mode === "think" && body){
       // chain of ellipses growing toward the balloon (balloon.cpp:1826)
       const ex = (b.routeRgn.left + b.routeRgn.right)/2, ey = c.bottom;
@@ -1285,7 +1322,7 @@ function panelSvg(panel, px){
     // drawn tail-to-head so the FIRST balloon ends up on top (panel.cpp:695)
     for(let i=panel.balloons.length-1;i>=0;i--){
       const b = panel.balloons[i];
-      if(b.cloud) parts.push(balloonSvg(b, b.speaker));
+      if(b.cloud) parts.push(balloonSvg(b, b.speaker, panel.balloons));
     }
     parts.push(`<rect x="${BORDER_W}" y="${BORDER_W}" width="${S-2*BORDER_W}" height="${S-2*BORDER_W}" fill="none" stroke="#000" stroke-width="${2*BORDER_W}"/>`);
     inner = parts.join("");
@@ -1347,7 +1384,8 @@ function send(raw, charId, modeOverride, flags){
     mode,
     talkTos: detectTalkTos(text, id),
     wheel: (w && w.touched) ? {emotion:w.emotion, intensity:w.intensity} : null,
-    ai: !!(flags && flags.ai)
+    ai: !!(flags && flags.ai),
+    replyTo: (flags && flags.replyTo) || null
   };
   if(w){ w.touched = false; w.emotion = EM.HAPPY; w.intensity = 0; }   // ResetAvatar
   // In a room the HOST owns message order, so everyone's strip lays out
@@ -1777,7 +1815,7 @@ function aiObserve(msg){
     if(p.busy || p.charId === msg.charId) continue;
     const addressed = (msg.talkTos||[]).includes(p.charId) ||
                       checkWord(msg.text.toLowerCase(), getArt(p.charId).name.toLowerCase());
-    if(addressed || (p.chatty && !(msg.talkTos||[]).length)) aiReplyAs(p);
+    if(addressed || (p.chatty && !(msg.talkTos||[]).length)) aiReplyAs(p, msg.charId);
   }
   /* A character addressed by name who is played by nobody — no human, no AI
      player — answers for themselves. In a room only the host's machine does
@@ -1791,7 +1829,7 @@ function aiObserve(msg){
     if(claimed.has(id) || !getArt(id)) continue;
     const p = AI_ADHOC[id] ||
       (AI_ADHOC[id] = {name: getArt(id).name + " (AI)", charId:id, chatty:false, busy:false});
-    if(!p.busy) aiReplyAs(p);
+    if(!p.busy) aiReplyAs(p, msg.charId);
   }
 }
 
@@ -1885,7 +1923,7 @@ function updateThinkingPanels(){
 function showThinking(id){ AI_THINKING.add(id); updateThinkingPanels(); }
 function hideThinking(id){ AI_THINKING.delete(id); updateThinkingPanels(); }
 
-async function aiReplyAs(p){
+async function aiReplyAs(p, replyToId){
   p.busy = true;
   const hint = document.getElementById("rulehint");
   hint.textContent = `💭 ${getArt(p.charId).name} is thinking…`;
@@ -1907,7 +1945,7 @@ async function aiReplyAs(p){
       : {emotion: EM.HAPPY, intensity: 0, touched:true};
     const mode = ["say","think","whisper","action"].includes(r.mode) ? r.mode : "say";
     hideThinking(p.charId);              // the real panel replaces the pending one
-    send(got.text.slice(0,200), p.charId, mode, {ai:true});
+    send(got.text.slice(0,200), p.charId, mode, {ai:true, replyTo: replyToId || null});
   }catch(e){
     hint.textContent = "🤖 " + getArt(p.charId).name + " lost their train of thought (" +
                        String(e.message||e).slice(0,80) + ")";
