@@ -537,11 +537,16 @@ function layoutOneBalloon(b, placed, free, rng){
   const ch2 = text2.textH + 2*pad.y;
   right = left + cw2;
 
-  /* --- vertical: below anything it overlaps, else share the top --- */
+  /* --- vertical: below anything it overlaps, else share the top ---
+     The cloud rects are only the spline's control frame: the rendered wobble
+     bulges up to WAVE_H beyond them (plus half the stroke), on BOTH facing
+     edges. DOCK_SHIFT covers one side's bump; clear the neighbor's too, or
+     stacked balloons visibly kiss. */
+  const BUMP_CLEAR = WAVE_H + 28;
   let top = free.top;
   for(const p of placed){
-    if(p.cloud.right < left) top = Math.max(top, p.cloud.top);
-    else top = Math.max(top, p.cloud.bottom + DOCK_SHIFT);
+    if(p.cloud.right + 2*WAVE_H + 28 < left) top = Math.max(top, p.cloud.top);
+    else top = Math.max(top, p.cloud.bottom + DOCK_SHIFT + BUMP_CLEAR);
   }
   let bottom = top + ch2;
 

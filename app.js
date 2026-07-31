@@ -686,7 +686,9 @@ async function fetchAI(prompt){
 window.AI_PLAYERS = [];   // [{name, charId, chatty, busy}]
 try{
   const saved = JSON.parse(localStorage.getItem("comicchat-aiplayers"));
-  if(Array.isArray(saved)) window.AI_PLAYERS = saved.map(p=>({name:p.name, charId:p.charId, chatty:!!p.chatty, busy:false}));
+  // Every AI player is chatty now: characters addressed by name already answer
+  // for themselves, so a "replies when addressed" player would be redundant.
+  if(Array.isArray(saved)) window.AI_PLAYERS = saved.map(p=>({name:p.name, charId:p.charId, chatty:true, busy:false}));
 }catch(e){}
 function aiPersistPlayers(){
   try{ localStorage.setItem("comicchat-aiplayers",
@@ -1037,7 +1039,6 @@ function openAiModal(){
   const chars = castIds().map(id=>`<option value="${id}">${esc(getArt(id).name)}</option>`).join("");
   const list = players.length
     ? players.map((p,i)=>`<div class="mrow">🤖 <b>${esc(p.name)}</b> plays ${esc(getArt(p.charId).name)}
-        ${p.chatty ? "(chatty)" : "(replies when addressed)"}
         <button data-rm="${i}">remove</button></div>`).join("")
     : `<div class="mrow small">No AI players yet.</div>`;
   const provOpts = Object.keys(AI_PROVIDERS).map(k=>
@@ -1056,10 +1057,10 @@ function openAiModal(){
       current small model; edit it to use any model your key can access.</div>
     <hr>${list}
     <div class="mrow">Add: <select id="mchar">${chars}</select>
-      <label><input type="checkbox" id="mchatty"> chatty (replies even when not addressed)</label>
       <button id="madd"><b>Add AI player</b></button></div>
-    <div class="small">An AI player answers when someone mentions its character's name.
-      Its replies use your key and appear to everyone in the room.</div>
+    <div class="small">Any character you address by name already answers for themselves —
+      an AI player goes further and joins in even when nobody addressed them.
+      Their replies use your key and appear to everyone in the room.</div>
     <div class="mrow"><label><input type="checkbox" id="mauto"${AI_CFG.autoCast===false?"":" checked"}>
       Unclaimed characters answer for themselves when addressed</label>
       <span class="small">(in a room, the host's AI does the talking)</span></div>`);
@@ -1134,8 +1135,7 @@ function openAiModal(){
       return;
     }
     const charId = m.el.querySelector("#mchar").value;
-    players.push({name: getArt(charId).name + " (AI)", charId,
-                  chatty: m.el.querySelector("#mchatty").checked, busy:false});
+    players.push({name: getArt(charId).name + " (AI)", charId, chatty:true, busy:false});
     aiPersistPlayers();
     if(typeof netAnnounceAI === "function" && netActive()) netAnnounceAI();
     m.close(); openAiModal();
