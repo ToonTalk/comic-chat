@@ -1755,7 +1755,9 @@ async function nanoDownload(onProgress){
   try{ if(sess.destroy) sess.destroy(); }catch(e){}
   NANO.state = "available";
 }
-nanoDetect();
+// kept as a promise so the AI dialog can't open before detection settles and
+// miss the on-device option
+const NANO_READY = nanoDetect();
 function aiPersistCfg(){ try{ localStorage.setItem("comicchat-ai-cfg", JSON.stringify(AI_CFG)); }catch(e){} }
 function aiKey(){ return AI_CFG.keys[AI_CFG.provider] || ""; }
 function aiModel(){
@@ -2161,7 +2163,8 @@ function openNetModal(){
 }
 
 /* ============================ AI setup wiring ============================ */
-function openAiModal(){
+async function openAiModal(){
+  try{ await NANO_READY; }catch(e){}
   const players = window.AI_PLAYERS;
   const chars = castIds().map(id=>`<option value="${id}">${esc(getArt(id).name)}</option>`).join("");
   const list = players.length
@@ -2181,7 +2184,8 @@ function openAiModal(){
     <div class="small mrow" id="mkeyhelp">The key stays in this browser's storage and goes only to the
       provider you chose — never to other players. Calls are made from whoever added the
       AI player, so only you need a key. The model box is prefilled with the provider's
-      current small model; edit it to use any model your key can access.</div>
+      current small model; edit it to use any model your key can access.
+      Your provider, model and key are remembered on this browser.</div>
     <hr>${list}
     <div class="mrow">Add: <select id="mchar">${chars}</select>
       <button id="madd"><b>Add AI player</b></button></div>
@@ -2200,6 +2204,10 @@ function openAiModal(){
       AI_CFG.models[AI_CFG.provider] = m.el.querySelector("#mmodel").value.trim();
       AI_CFG.keys[AI_CFG.provider] = m.el.querySelector("#mkey").value.trim();
     }
+    // Any engagement with these settings — saving a key, adding a player, or
+    // switching provider — is a deliberate choice, so it must survive reloads
+    // and outrank Nano's fresh-install default.
+    AI_CFG.chosen = true;
     aiPersistCfg();
   };
   const refreshProviderRows = ()=>{
