@@ -4,7 +4,7 @@ A faithful web port of Microsoft Comic Chat (1996): type a line and it appears a
 comic panel, with the original characters, poses, balloons and panel layout.
 
 - `index.html`: Web Comic Chat. Open it in a browser; no build step and no server.
-- `comic-chat-ai.html`: the same, with AI characters to chat with.
+- `comic-chat-ai.html`: the same, with AI participants in the chat (Claude, ChatGPT or Gemini, with your own key).
 - `making-of.html` and `comic-chat-retrospective.html`: how it was made.
 - `fidelity-report.html`: how closely it follows the original.
 
